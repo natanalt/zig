@@ -166,7 +166,9 @@ pub const TestContext = struct {
         /// to deleting the source file and creating a new one from scratch; or
         /// you can keep it mostly consistent, with small changes, testing the
         /// effects of the incremental compilation.
-        src: [:0]const u8,
+        ///
+        /// This can be null if we expect output from C-only sources.
+        src: ?[:0]const u8 = null,
         name: []const u8,
         case: union(enum) {
             /// Check the main binary output file against an expected set of bytes.
@@ -222,9 +224,22 @@ pub const TestContext = struct {
         link_libc: bool = false,
 
         files: std.ArrayList(File),
+        c_source_files: std.ArrayList(File),
 
         pub fn addSourceFile(case: *Case, name: []const u8, src: [:0]const u8) void {
             case.files.append(.{ .path = name, .src = src }) catch @panic("out of memory");
+        }
+
+        pub fn addCSourceFile(case: *Case, name: []const u8, src: [:0]const u8) void {
+            case.c_source_files.append(.{ .path = name, .src = src }) catch @panic("out of memory");
+        }
+
+        /// Compare output without main Zig module present, e.g., building from C sources only.
+        pub fn addCCompareOutput(self: *Case, result: []const u8) void {
+            self.updates.append(.{
+                .name = "update",
+                .case = .{ .Execution = result },
+            }) catch @panic("out of memory");
         }
 
         /// Adds a subcase in which the module is updated with `src`, and a C
@@ -359,6 +374,7 @@ pub const TestContext = struct {
             .updates = std.ArrayList(Update).init(ctx.cases.allocator),
             .output_mode = .Exe,
             .files = std.ArrayList(File).init(ctx.arena),
+            .c_source_files = std.ArrayList(File).init(ctx.arena),
         }) catch @panic("out of memory");
         return &ctx.cases.items[ctx.cases.items.len - 1];
     }
@@ -378,6 +394,7 @@ pub const TestContext = struct {
             .output_mode = .Exe,
             .object_format = .c,
             .files = std.ArrayList(File).init(ctx.arena),
+            .c_source_files = std.ArrayList(File).init(ctx.arena),
         }) catch @panic("out of memory");
         return &ctx.cases.items[ctx.cases.items.len - 1];
     }
@@ -391,6 +408,7 @@ pub const TestContext = struct {
             .updates = std.ArrayList(Update).init(ctx.cases.allocator),
             .output_mode = .Exe,
             .files = std.ArrayList(File).init(ctx.arena),
+            .c_source_files = std.ArrayList(File).init(ctx.arena),
             .backend = .llvm,
             .link_libc = true,
         }) catch @panic("out of memory");
@@ -408,6 +426,7 @@ pub const TestContext = struct {
             .updates = std.ArrayList(Update).init(ctx.cases.allocator),
             .output_mode = .Obj,
             .files = std.ArrayList(File).init(ctx.arena),
+            .c_source_files = std.ArrayList(File).init(ctx.arena),
         }) catch @panic("out of memory");
         return &ctx.cases.items[ctx.cases.items.len - 1];
     }
@@ -424,6 +443,7 @@ pub const TestContext = struct {
             .output_mode = .Exe,
             .is_test = true,
             .files = std.ArrayList(File).init(ctx.arena),
+            .c_source_files = std.ArrayList(File).init(ctx.arena),
         }) catch @panic("out of memory");
         return &ctx.cases.items[ctx.cases.items.len - 1];
     }
@@ -447,6 +467,7 @@ pub const TestContext = struct {
             .output_mode = .Obj,
             .object_format = .c,
             .files = std.ArrayList(File).init(ctx.arena),
+            .c_source_files = std.ArrayList(File).init(ctx.arena),
         }) catch @panic("out of memory");
         return &ctx.cases.items[ctx.cases.items.len - 1];
     }
@@ -871,6 +892,7 @@ pub const TestContext = struct {
                         .is_test = is_test,
                         .output_mode = output_mode,
                         .files = std.ArrayList(TestContext.File).init(ctx.cases.allocator),
+                        .c_source_files = std.ArrayList(TestContext.File).init(ctx.cases.allocator),
                     }) catch @panic("out of memory");
                     const case = &ctx.cases.items[ctx.cases.items.len - 1];
                     opt_case = case;
@@ -1020,6 +1042,16 @@ pub const TestContext = struct {
             &[_][]const u8{ tmp_dir_path, "zig-cache" },
         );
 
+        var c_source_files = std.ArrayList(Compilation.CSourceFile).init(arena);
+        try c_source_files.ensureTotalCapacity(case.c_source_files.items.len);
+        for (case.c_source_files.items) |file| {
+            try tmp.dir.writeFile(file.path, file.src);
+            const full_path = try std.fs.path.join(arena, &[_][]const u8{ tmp_dir_path, file.path });
+            c_source_files.appendAssumeCapacity(.{
+                .src_path = full_path,
+                .extra_flags = &[0][]const u8{},
+            });
+        }
         for (case.files.items) |file| {
             try tmp.dir.writeFile(file.path, file.src);
         }
@@ -1039,7 +1071,7 @@ pub const TestContext = struct {
 
             assert(case.updates.items.len == 1);
             const update = case.updates.items[0];
-            try tmp.dir.writeFile(tmp_src_path, update.src);
+            try tmp.dir.writeFile(tmp_src_path, update.src.?);
 
             var zig_args = std.ArrayList([]const u8).init(arena);
             try zig_args.append(std.testing.zig_exe_path);
@@ -1160,11 +1192,14 @@ pub const TestContext = struct {
             .path = local_cache_path,
         };
 
-        var main_pkg: Package = .{
-            .root_src_directory = .{ .path = tmp_dir_path, .handle = tmp.dir },
-            .root_src_path = tmp_src_path,
+        var main_pkg: ?Package = blk: {
+            if (case.updates.items.len == 1 and case.updates.items[0].src == null) break :blk null;
+            break :blk Package{
+                .root_src_directory = .{ .path = tmp_dir_path, .handle = tmp.dir },
+                .root_src_path = tmp_src_path,
+            };
         };
-        defer main_pkg.table.deinit(allocator);
+        defer if (main_pkg) |*pkg| pkg.table.deinit(allocator);
 
         const bin_name = try std.zig.binNameAlloc(arena, .{
             .root_name = "test_case",
@@ -1204,7 +1239,7 @@ pub const TestContext = struct {
             .optimize_mode = case.optimize_mode,
             .emit_bin = emit_bin,
             .emit_h = emit_h,
-            .main_pkg = &main_pkg,
+            .main_pkg = if (main_pkg) |*pkg| pkg else null,
             .keep_source_files_loaded = true,
             .object_format = case.object_format,
             .is_native_os = case.target.isNativeOs(),
@@ -1214,6 +1249,7 @@ pub const TestContext = struct {
             .use_llvm = use_llvm,
             .use_stage1 = null, // We already handled stage1 tests
             .self_exe_path = std.testing.zig_exe_path,
+            .c_source_files = c_source_files.items,
         });
         defer comp.destroy();
 
@@ -1222,10 +1258,12 @@ pub const TestContext = struct {
             update_node.activate();
             defer update_node.end();
 
-            var sync_node = update_node.start("write", 0);
-            sync_node.activate();
-            try tmp.dir.writeFile(tmp_src_path, update.src);
-            sync_node.end();
+            if (update.src) |src| {
+                var sync_node = update_node.start("write", 0);
+                sync_node.activate();
+                try tmp.dir.writeFile(tmp_src_path, src);
+                sync_node.end();
+            }
 
             var module_node = update_node.start("parse/analysis/codegen", 0);
             module_node.activate();

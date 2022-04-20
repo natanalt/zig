@@ -19,4 +19,5 @@ pub fn addCases(ctx: *TestContext) !void {
     try @import("stage2/sparcv9.zig").addCases(ctx);
     // https://github.com/ziglang/zig/issues/10968
     //try @import("stage2/nvptx.zig").addCases(ctx);
+    try @import("link/macho.zig").addCases(ctx);
 }
